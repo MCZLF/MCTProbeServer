@@ -36,7 +36,6 @@ namespace ProbeServer
             LoadCounter();
             Log("Probe 探针服务端程序启动");
             Log($"[Config]UseFrp:{UseFrp}");
-
             ResetDailyFile();
             ScheduleDailySummary();
 
