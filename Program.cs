@@ -3,6 +3,7 @@ using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace ProbeServer
 {
@@ -231,12 +232,15 @@ namespace ProbeServer
 
         private static async Task ReadRemainingPayloadAsync(NetworkStream stream, MemoryStream ms, byte[] buffer)
         {
-            var deadline = DateTime.UtcNow.AddMilliseconds(800);
+            var deadline = DateTime.UtcNow.AddMilliseconds(5000);
             while (ms.Length < MaxPayloadBytes && DateTime.UtcNow < deadline)
             {
                 try
                 {
-                    using var readCts = new CancellationTokenSource(200);
+                    var remaining = deadline - DateTime.UtcNow;
+                    if (remaining <= TimeSpan.Zero) break;
+
+                    using var readCts = new CancellationTokenSource(remaining > TimeSpan.FromMilliseconds(1000) ? TimeSpan.FromMilliseconds(1000) : remaining);
                     var read = await stream.ReadAsync(buffer, 0, buffer.Length, readCts.Token);
                     if (read == 0) break;
                     ms.Write(buffer, 0, read);
