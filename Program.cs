@@ -1,4 +1,3 @@
-﻿// Program.cs  (.NET 8 Console, non-top-level)
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -9,30 +8,30 @@ namespace ProbeServer
 {
     internal static class Program
     {
-        // ================== 可改常量 ==================
         private static readonly int TcpPort = 17600;
-        private static readonly bool UseFrp = true;      // 是否启用 PROXY v2
-        private static readonly int MaxUploadPerHour = 0; // 0=不限制
+        private static readonly bool UseFrp = true;
+        private static readonly int MaxUploadPerHour = 0;
+        private static readonly int MaxPayloadBytes = 1024 * 512;
 
-        // ================== 路径 ==================
         private static readonly string LogDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "probe");
+        private static readonly string CrashDir = Path.Combine(LogDir, "crash");
         private static readonly string SelfLog = Path.Combine(LogDir, "self.log");
         private static readonly string LimitDb = Path.Combine(LogDir, "upload_limit.json");
 
-        // ================== 计数器 ==================
         private static readonly Dictionary<string, int> Counter = new();
         private static int _currentHour = -1;
 
-        // 每日统计
         private static readonly object DailyLock = new();
+        private static readonly object CrashLock = new();
         private static string _todayFile = string.Empty;
-        private static readonly Dictionary<string, int> _versionCounter = new(); // version -> count
+        private static readonly Dictionary<string, int> _versionCounter = new();
         private static int _totalToday = 0;
         private static Timer? _dailyTimer;
 
         private static void Main()
         {
             Directory.CreateDirectory(LogDir);
+            Directory.CreateDirectory(CrashDir);
             LoadCounter();
             Log("Probe 探针服务端程序启动");
             Log($"[Config]UseFrp:{UseFrp}");
@@ -92,7 +91,7 @@ namespace ProbeServer
         {
             var now = DateTime.Now;
             var due = now.Date.AddDays(1).AddSeconds(-1) - now;
-            if (due <= TimeSpan.Zero)                 // 保险
+            if (due <= TimeSpan.Zero)
                 due = TimeSpan.FromMilliseconds(1);
 
             _dailyTimer?.Dispose();
@@ -115,21 +114,17 @@ namespace ProbeServer
         {
             lock (DailyLock)
             {
-                /* ---- fix 修复计时器刷屏日志文件 ---- */
                 if (_totalToday == 0) return;
 
-                /* ---- 2. 拼汇总（只留核心数据）---- */
                 var sb = new StringBuilder();
                 sb.AppendLine($"日期：{DateTime.Now:yyyy-MM-dd}");
                 sb.AppendLine($"总启动次数：{_totalToday}");
                 foreach (var kv in _versionCounter.OrderByDescending(v => v.Value))
                     sb.AppendLine($"版本 {kv.Key}：{kv.Value} 次");
 
-                /* ---- 3. 写 summary.log（纯汇总）---- */
                 File.AppendAllText(Path.Combine(LogDir, "summary.log"),
                     $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}]{Environment.NewLine}{sb}{Environment.NewLine}");
 
-                /* ---- 4. 原逻辑：把汇总+原始内容写回当天文件 ---- */
                 if (File.Exists(_todayFile))
                 {
                     var raw = File.ReadAllText(_todayFile);
@@ -158,64 +153,177 @@ namespace ProbeServer
                 try
                 {
                     using var client = await listener.AcceptTcpClientAsync();
-                    string clientIp;
+                    string clientIp = ((IPEndPoint)client.Client.RemoteEndPoint!).Address.ToString();
+                    using var stream = client.GetStream();
+                    var raw = await ReadPayloadWithOptionalProxyProtocolAsync(stream);
 
-                    if (UseFrp)
+                    if (raw.ProxySuccess)
                     {
-                        var (success, realIp) = await ProxyProtocolV2Reader.TryGetRealIpAsync(client.GetStream());
-                        clientIp = success ? realIp : "unknown";
-                        Log($"[TCP] PROXY v2 解析结果 success={success} real-ip=>{clientIp}");
+                        clientIp = raw.ProxyIp;
+                        Log($"[TCP] PROXY v2 解析成功 real-ip=>{clientIp}");
                     }
                     else
                     {
-                        clientIp = ((IPEndPoint)client.Client.RemoteEndPoint!).Address.ToString();
                         Log($"[TCP] 连接 {clientIp}");
                     }
 
-                    using var stream = client.GetStream();
-                    var buffer = new byte[1024 * 64];
-                    var len = await stream.ReadAsync(buffer, 0, buffer.Length);
-                    var raw = Encoding.UTF8.GetString(buffer, 0, len);
-
-                    // 解析客户端文本
-                    var lines = raw.Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries);
-                    string? version = null;
-                    var content = new List<string>();
-                    bool inBlock = false;
-                    foreach (var line in lines)
-                    {
-                        if (line == "====ProbeContext====") { inBlock = true; continue; }
-                        if (inBlock && line.StartsWith("Version = "))
-                            version = line["Version = ".Length..].Trim();
-                        else
-                            content.Add(line);
-                    }
-                    version ??= "0.0.0.0";
+                    var payload = raw.Payload;
 
                     if (!CanUpload(clientIp))
                     {
                         Log($"[TCP] {clientIp} 已达 {MaxUploadPerHour} 次/小时，拒绝");
-                        byte[] deny = Encoding.UTF8.GetBytes("LIMIT\r\n");
-                        await stream.WriteAsync(deny, 0, deny.Length);
+                        await WriteResponseAsync(stream, "LIMIT\r\n");
                         continue;
                     }
 
-                    lock (DailyLock)
+                    if (payload.StartsWith("====CrashReport====", StringComparison.Ordinal))
                     {
-                        File.AppendAllText(_todayFile, raw + Environment.NewLine);
-                        _totalToday++;
-                        _versionCounter[version] = _versionCounter.GetValueOrDefault(version) + 1;
+                        HandleCrashReport(payload, clientIp);
+                    }
+                    else if (payload.StartsWith("====ProbeContext====", StringComparison.Ordinal))
+                    {
+                        HandleProbe(payload, clientIp);
+                    }
+                    else
+                    {
+                        Log($"[TCP] 未识别的数据包，ip={clientIp}, length={Encoding.UTF8.GetByteCount(payload)}");
                     }
 
-                    Log($"[TCP] 追加写入 => {_todayFile} (今日第 {_totalToday} 条, ver={version})");
-                    byte[] ok = Encoding.UTF8.GetBytes("OK\r\n");
-                    await stream.WriteAsync(ok, 0, ok.Length);
+                    await WriteResponseAsync(stream, "OK\r\n");
                 }
                 catch (Exception ex)
                 {
                     Log($"[TCP] 异常: {ex.Message}");
                 }
             }
+        }
+
+        private static async Task<(string Payload, bool ProxySuccess, string ProxyIp)> ReadPayloadWithOptionalProxyProtocolAsync(NetworkStream stream)
+        {
+            using var ms = new MemoryStream();
+            var buffer = new byte[8192];
+            var firstRead = await stream.ReadAsync(buffer, 0, buffer.Length);
+            if (firstRead == 0) return (string.Empty, false, string.Empty);
+
+            var offset = 0;
+            var count = firstRead;
+            var proxySuccess = false;
+            var proxyIp = string.Empty;
+
+            if (UseFrp && ProxyProtocolV2Reader.TryParse(buffer, firstRead, out var headerLength, out proxyIp))
+            {
+                proxySuccess = true;
+                offset = headerLength;
+                count = firstRead - headerLength;
+            }
+
+            if (count > 0)
+                ms.Write(buffer, offset, count);
+
+            await ReadRemainingPayloadAsync(stream, ms, buffer);
+
+            return (Encoding.UTF8.GetString(ms.ToArray()), proxySuccess, proxyIp);
+        }
+
+        private static async Task ReadRemainingPayloadAsync(NetworkStream stream, MemoryStream ms, byte[] buffer)
+        {
+            using var timeoutCts = new CancellationTokenSource(300);
+            while (ms.Length < MaxPayloadBytes)
+            {
+                try
+                {
+                    var readTask = stream.ReadAsync(buffer, 0, buffer.Length, timeoutCts.Token);
+                    var completedTask = await Task.WhenAny(readTask, Task.Delay(50, timeoutCts.Token));
+                    if (completedTask != readTask) break;
+
+                    var read = await readTask;
+                    if (read == 0) break;
+                    ms.Write(buffer, 0, read);
+
+                    if (!stream.DataAvailable) break;
+                }
+                catch
+                {
+                    break;
+                }
+            }
+        }
+
+        private static async Task WriteResponseAsync(NetworkStream stream, string response)
+        {
+            var data = Encoding.UTF8.GetBytes(response);
+            await stream.WriteAsync(data, 0, data.Length);
+        }
+
+        private static void HandleProbe(string raw, string clientIp)
+        {
+            var lines = raw.Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries);
+            string? version = null;
+            var content = new List<string>();
+            bool inBlock = false;
+            foreach (var line in lines)
+            {
+                if (line == "====ProbeContext====") { inBlock = true; continue; }
+                if (inBlock && line.StartsWith("Version = "))
+                    version = line["Version = ".Length..].Trim();
+                else
+                    content.Add(line);
+            }
+            version ??= "0.0.0.0";
+
+            lock (DailyLock)
+            {
+                File.AppendAllText(_todayFile, raw + Environment.NewLine);
+                _totalToday++;
+                _versionCounter[version] = _versionCounter.GetValueOrDefault(version) + 1;
+            }
+
+            Log($"[TCP] Probe 追加写入 => {_todayFile} (今日第 {_totalToday} 条, ip={clientIp}, ver={version})");
+        }
+
+        private static void HandleCrashReport(string raw, string clientIp)
+        {
+            var parsed = ParseCrashReport(raw);
+            var timestamp = DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss");
+            var safeVersion = MakeSafeFileName(parsed.Version ?? "Unknown");
+            var safeIp = MakeSafeFileName(clientIp);
+            var fileName = $"crash_{timestamp}_{safeIp}_{safeVersion}.txt";
+            var filePath = Path.Combine(CrashDir, fileName);
+
+            lock (CrashLock)
+            {
+                Directory.CreateDirectory(CrashDir);
+                File.WriteAllText(filePath, raw, Encoding.UTF8);
+                File.AppendAllText(Path.Combine(CrashDir, "index.log"),
+                    $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] ip={clientIp} version={parsed.Version ?? "Unknown"} file={fileName} clientFile={parsed.FileName ?? "Unknown"}{Environment.NewLine}");
+            }
+
+            Log($"[TCP] CrashReport 已保存 => {filePath} (ip={clientIp}, ver={parsed.Version ?? "Unknown"})");
+        }
+
+        private static (string? Version, string? FileName) ParseCrashReport(string raw)
+        {
+            string? version = null;
+            string? fileName = null;
+            var lines = raw.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
+            foreach (var line in lines)
+            {
+                if (line.Length == 0) break;
+                if (line.StartsWith("Version = ", StringComparison.Ordinal))
+                    version = line["Version = ".Length..].Trim();
+                else if (line.StartsWith("FileName = ", StringComparison.Ordinal))
+                    fileName = line["FileName = ".Length..].Trim();
+            }
+
+            return (version, fileName);
+        }
+
+        private static string MakeSafeFileName(string value)
+        {
+            var safe = value;
+            foreach (var invalidChar in Path.GetInvalidFileNameChars())
+                safe = safe.Replace(invalidChar, '_');
+            return string.IsNullOrWhiteSpace(safe) ? "unknown" : safe;
         }
         #endregion
 
@@ -224,47 +332,35 @@ namespace ProbeServer
         {
             private static readonly byte[] Sig = "\r\n\r\n\0\r\nQUIT\n"u8.ToArray();
 
-            public static async Task<(bool success, string ip)> TryGetRealIpAsync(NetworkStream stream)
+            public static bool TryParse(byte[] buffer, int length, out int headerLength, out string ip)
             {
-                var header = new byte[16];
-                if (!await ReadExactlyAsync(stream, header, 0, 16))
-                    return (false, string.Empty);
+                headerLength = 0;
+                ip = string.Empty;
+
+                if (length < 16) return false;
 
                 for (int i = 0; i < 12; i++)
-                    if (header[i] != Sig[i])
-                        return (false, string.Empty);
+                    if (buffer[i] != Sig[i])
+                        return false;
 
-                int verCmd = header[12];
-                if ((verCmd & 0xF0) != 0x20) return (false, string.Empty);
+                int verCmd = buffer[12];
+                if ((verCmd & 0xF0) != 0x20) return false;
 
-                int family = header[13] >> 4;
-                int len = (header[14] << 8) | header[15];
+                int family = buffer[13] >> 4;
+                int len = (buffer[14] << 8) | buffer[15];
+                headerLength = 16 + len;
 
-                var payload = new byte[len];
-                if (!await ReadExactlyAsync(stream, payload, 0, len))
-                    return (false, string.Empty);
+                if (length < headerLength) return false;
 
                 if (family == 0x01 && len >= 12)
                 {
                     byte[] ipBytes = new byte[4];
-                    Array.Copy(payload, 0, ipBytes, 0, 4);
-                    var ip = new IPAddress(ipBytes).ToString();
-                    return (true, ip);
+                    Array.Copy(buffer, 16, ipBytes, 0, 4);
+                    ip = new IPAddress(ipBytes).ToString();
+                    return true;
                 }
 
-                return (false, string.Empty);
-            }
-
-            private static async Task<bool> ReadExactlyAsync(NetworkStream stream, byte[] buffer, int offset, int count)
-            {
-                int read = 0;
-                while (read < count)
-                {
-                    int r = await stream.ReadAsync(buffer, offset + read, count - read);
-                    if (r == 0) return false;
-                    read += r;
-                }
-                return true;
+                return false;
             }
         }
         #endregion
