@@ -25,6 +25,7 @@ namespace ProbeServer
         private static readonly object CrashLock = new();
         private static string _todayFile = string.Empty;
         private static readonly Dictionary<string, int> _versionCounter = new();
+        private static readonly HashSet<string> _dailyIps = new(StringComparer.OrdinalIgnoreCase);
         private static int _totalToday = 0;
         private static Timer? _dailyTimer;
 
@@ -84,6 +85,7 @@ namespace ProbeServer
                 _todayFile = Path.Combine(LogDir, $"{DateTime.Now:yyyy-MM-dd}-probe.txt");
                 _totalToday = 0;
                 _versionCounter.Clear();
+                _dailyIps.Clear();
             }
         }
 
@@ -119,6 +121,7 @@ namespace ProbeServer
                 var sb = new StringBuilder();
                 sb.AppendLine($"日期：{DateTime.Now:yyyy-MM-dd}");
                 sb.AppendLine($"总启动次数：{_totalToday}");
+                sb.AppendLine($"实际启动人数：{_dailyIps.Count}");
                 foreach (var kv in _versionCounter.OrderByDescending(v => v.Value))
                     sb.AppendLine($"版本 {kv.Key}：{kv.Value} 次");
 
@@ -131,6 +134,7 @@ namespace ProbeServer
                     var all = new StringBuilder();
                     all.AppendLine("[summery]");
                     all.AppendLine($"今日共启动 {_totalToday} 次");
+                    all.AppendLine($"今日实际启动 {_dailyIps.Count} 次");
                     foreach (var kv in _versionCounter.OrderByDescending(v => v.Value))
                         all.AppendLine($"{kv.Key} : {kv.Value}次");
                     all.AppendLine();
@@ -227,26 +231,70 @@ namespace ProbeServer
 
         private static async Task ReadRemainingPayloadAsync(NetworkStream stream, MemoryStream ms, byte[] buffer)
         {
-            using var timeoutCts = new CancellationTokenSource(300);
-            while (ms.Length < MaxPayloadBytes)
+            var deadline = DateTime.UtcNow.AddMilliseconds(800);
+            while (ms.Length < MaxPayloadBytes && DateTime.UtcNow < deadline)
             {
                 try
                 {
-                    var readTask = stream.ReadAsync(buffer, 0, buffer.Length, timeoutCts.Token);
-                    var completedTask = await Task.WhenAny(readTask, Task.Delay(50, timeoutCts.Token));
-                    if (completedTask != readTask) break;
-
-                    var read = await readTask;
+                    using var readCts = new CancellationTokenSource(200);
+                    var read = await stream.ReadAsync(buffer, 0, buffer.Length, readCts.Token);
                     if (read == 0) break;
                     ms.Write(buffer, 0, read);
 
-                    if (!stream.DataAvailable) break;
+                    if (IsPayloadComplete(ms)) break;
                 }
                 catch
                 {
                     break;
                 }
             }
+        }
+
+        private static bool IsPayloadComplete(MemoryStream ms)
+        {
+            var payload = Encoding.UTF8.GetString(ms.ToArray());
+            if (payload.StartsWith("====ProbeContext====", StringComparison.Ordinal))
+                return payload.Contains("Time = ", StringComparison.Ordinal);
+
+            if (!payload.StartsWith("====CrashReport====", StringComparison.Ordinal))
+                return false;
+
+            var (separatorIndex, separatorLength) = FindHeaderSeparator(payload);
+            if (separatorIndex < 0) return false;
+
+            var contentLength = TryReadContentLength(payload);
+            if (contentLength <= 0) return true;
+
+            var bodyStart = separatorIndex + separatorLength;
+            var bodyBytes = Encoding.UTF8.GetByteCount(payload[bodyStart..]);
+            return bodyBytes >= contentLength;
+        }
+
+        private static (int Index, int Length) FindHeaderSeparator(string payload)
+        {
+            var crlfIndex = payload.IndexOf("\r\n\r\n", StringComparison.Ordinal);
+            if (crlfIndex >= 0) return (crlfIndex, 4);
+
+            var lfIndex = payload.IndexOf("\n\n", StringComparison.Ordinal);
+            if (lfIndex >= 0) return (lfIndex, 2);
+
+            return (-1, 0);
+        }
+
+        private static int TryReadContentLength(string payload)
+        {
+            var lines = payload.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
+            foreach (var line in lines)
+            {
+                if (line.Length == 0) break;
+                if (line.StartsWith("ContentLength = ", StringComparison.Ordinal) &&
+                    int.TryParse(line["ContentLength = ".Length..].Trim(), out var length))
+                {
+                    return length;
+                }
+            }
+
+            return 0;
         }
 
         private static async Task WriteResponseAsync(NetworkStream stream, string response)
@@ -275,6 +323,7 @@ namespace ProbeServer
             {
                 File.AppendAllText(_todayFile, raw + Environment.NewLine);
                 _totalToday++;
+                _dailyIps.Add(clientIp);
                 _versionCounter[version] = _versionCounter.GetValueOrDefault(version) + 1;
             }
 
